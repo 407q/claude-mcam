@@ -1,0 +1,4 @@
+__pycache__/
+.mcam-cache/
+*.mcam.json.tmp
+synced/
