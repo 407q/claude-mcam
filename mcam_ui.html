@@ -51,6 +51,7 @@ input[type=number], input[type=text] { background: var(--bg); border: 1px solid 
 .ctl { flex: 0 0 340px; padding: 5px 8px; background: var(--panel); border-right: 1px solid var(--line);
   display: flex; flex-direction: column; gap: 4px; }
 .row.sel .ctl { background: #1f2a38; }
+.row.silent canvas { opacity: .45; }
 .ctl .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ctl .name small { color: var(--dim); font-weight: 400; margin-left: 4px; }
 .ctl .line { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
@@ -88,6 +89,7 @@ canvas { display: block; width: 100%; }
 <div id="transport">
   <button id="play" class="big" title="Space">▶ 再生</button>
   <button id="loop" title="L: 再生ヘッド前後 1 秒をループ">⟲ ループ</button>
+  <button id="scrub" class="on" title="U: 再生ヘッドを動かしたときにその位置の音を鳴らす">スクラブ</button>
   <span id="time" class="mono">0:00:00.000</span>
   <div class="sep"></div>
   <button id="fit" title="Z">全体表示</button>
@@ -108,7 +110,7 @@ canvas { display: block; width: 100%; }
 <div id="help">
   <kbd>Space</kbd> 再生/停止　<kbd>←</kbd><kbd>→</kbd> 1 フレーム（<kbd>Shift</kbd> 1 秒）
   選択トラックを <kbd>,</kbd><kbd>.</kbd> ±1 ms　<kbd>&lt;</kbd><kbd>&gt;</kbd> ±10 ms　<kbd>[</kbd><kbd>]</kbd> ±1 フレーム
-  <kbd>M</kbd> 再生ヘッドにマーカー　<kbd>A</kbd> マーカーで揃える　<kbd>L</kbd> ループ
+  <kbd>M</kbd> 消音　<kbd>S</kbd> ソロ　<kbd>K</kbd> 再生ヘッドにマーカー　<kbd>U</kbd> スクラブ切替　<kbd>↑</kbd><kbd>↓</kbd> トラック選択　<kbd>A</kbd> マーカーで揃える　<kbd>L</kbd> ループ
   <kbd>Ctrl+Z</kbd>/<kbd>Ctrl+Shift+Z</kbd> 取り消し/やり直し
   波形をドラッグで移動（<kbd>Shift</kbd> 微調整）、クリックで再生ヘッド、<kbd>Alt</kbd>+クリック／ダブルクリックでマーカー、ホイールでズーム（<kbd>Shift</kbd> 横スクロール）
 </div>
@@ -146,69 +148,159 @@ const refFps = () => (tracks.find(t => t.video && t.video.fps) || { video: { fps
 const ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
 const master = ctx.createGain(); master.connect(ctx.destination);
 
+// 音声は「ファイル時刻 2 秒ごとのブロック」単位で取得してキャッシュし、再生・ループ・スクラブで共有する。
+// ブロック b はファイル時刻 [2b, 2b+2) のちょうど 2*sr サンプルなので、並べればすき間なくつながる。
+const BLOCK_SEC = 2, CACHE_MAX = 96;
+const blockCache = new Map();
+function getBlock(i, b) {
+  const key = i + ":" + b;
+  let p = blockCache.get(key);
+  if (p) { blockCache.delete(key); blockCache.set(key, p); return p; }
+  const sr = ctx.sampleRate, n = BLOCK_SEC * sr;
+  p = fetch(`/pcm?i=${i}&s=${(b * BLOCK_SEC).toFixed(6)}&n=${n}&sr=${sr}`)
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); })
+    .then(raw => {
+      const buf = new Float32Array(raw);
+      const ab = ctx.createBuffer(2, n, sr);
+      const L = ab.getChannelData(0), R = ab.getChannelData(1);
+      for (let k = 0; k < n; k++) { L[k] = buf[2 * k]; R[k] = buf[2 * k + 1]; }
+      return ab;
+    })
+    .catch(() => { blockCache.delete(key); return null; });
+  blockCache.set(key, p);
+  while (blockCache.size > CACHE_MAX) blockCache.delete(blockCache.keys().next().value);
+  return p;
+}
+const audioEnd = (t) => t.audio.start + t.audio.dur;
+const firstBlock = (t, T) => Math.max(0, Math.floor((T - t.offset) / BLOCK_SEC));
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// スピーカーから実際に音が出るまでの遅れ。映像と再生ヘッドはこのぶん遅らせて、聞こえている音に合わせる
+const outLatency = () => (ctx.outputLatency || 0) + (ctx.baseLatency || 0);
+
+function seekVideo(t, want, timeout) {
+  const el = t.el;
+  if (!el || !el.src || el.readyState < 1 || want < t.span[0] || want > t.span[1]) return Promise.resolve();
+  if (Math.abs(el.currentTime - want) < 0.0005 && !el.seeking) return Promise.resolve();
+  return new Promise(res => {
+    const done = () => { el.removeEventListener("seeked", done); res(); };
+    el.addEventListener("seeked", done);
+    el.currentTime = want;
+    setTimeout(done, timeout);
+  });
+}
+
 const player = {
-  playing: false, gen: 0, ctx0: 0, tl0: 0, sources: [],
-  now() { return this.playing ? this.tl0 + (ctx.currentTime - this.ctx0) : playhead; },
-  async start(T) {
-    await ctx.resume();
+  playing: false, gen: 0, ctx0: Infinity, tl0: 0, sources: [],
+  // ctx0 が決まるまで（準備中）は再生ヘッドを開始位置に留めておく
+  now() { return this.playing ? this.tl0 + Math.max(0, ctx.currentTime - this.ctx0 - outLatency()) : playhead; },
+  get ready() { return this.playing && this.ctx0 !== Infinity; },
+  async start(T, opts = {}) {
+    const gen = ++this.gen;
     this.stopSources();
-    this.gen++;
-    this.playing = true;
-    this.tl0 = T;
-    this.ctx0 = ctx.currentTime + 0.15;
-    const gen = this.gen;
-    tracks.forEach((t, i) => { if (t.audio) this.feed(i, gen); });
-    for (const t of tracks) if (t.el) t.el.playbackRate = 1;
+    this.playing = true; this.tl0 = T; this.ctx0 = Infinity;
+    for (const t of tracks) if (t.el) { t.el.pause(); t.el.playbackRate = 1; }
     updatePlayBtn();
+    await ctx.resume();
+    // 開始位置の音声ブロックが全トラックぶん揃い、映像のシークが終わってから時計を動かす
+    const waits = tracks.map((t, i) => t.audio && T - t.offset < audioEnd(t) ? getBlock(i, firstBlock(t, T)) : null);
+    if (!opts.fast) for (const t of tracks) if (t.el) waits.push(seekVideo(t, T - t.offset, 400));
+    await Promise.all(waits);
+    if (gen !== this.gen) return;
+    this.ctx0 = ctx.currentTime + 0.02;
+    tracks.forEach((t, i) => { if (t.audio) this.feed(i, gen); });
   },
   stop() {
     if (!this.playing) return;
     playhead = this.now();
-    this.playing = false; this.gen++;
+    this.playing = false; this.gen++; this.ctx0 = Infinity;
     this.stopSources();
     for (const t of tracks) if (t.el) { t.el.pause(); t.el.playbackRate = 1; }
     updatePlayBtn();
   },
-  restart() { if (this.playing) this.start(this.now()); },
+  restart() { if (this.playing) this.start(this.now(), { fast: true }); },
   stopSources() { for (const s of this.sources) { try { s.stop(); } catch (e) {} } this.sources = []; },
   async feed(i, gen) {
     const t = tracks[i];
-    const sr = ctx.sampleRate;
-    const fileEnd = t.audio.start + t.audio.dur;
-    let fileT = this.tl0 - t.offset;                       // 再生開始時点のファイル時刻
-    let s0 = Math.max(0, Math.round(fileT * sr));
-    let first = true;
-    while (gen === this.gen && s0 / sr < fileEnd) {
-      const when = this.ctx0 + (s0 / sr + t.offset - this.tl0);
+    let b = firstBlock(t, this.tl0);
+    while (gen === this.gen && b * BLOCK_SEC < audioEnd(t)) {
+      const when = this.ctx0 + (b * BLOCK_SEC + t.offset - this.tl0);   // ブロック先頭が鳴るべき時刻
+      getBlock(i, b);                                                   // 先読み
       const lead = when - ctx.currentTime;
-      if (lead > 3) { await new Promise(r => setTimeout(r, (lead - 3) * 1000)); continue; }
-      const n = Math.round((first ? 1 : 5) * sr);
-      first = false;
-      let buf;
-      try {
-        const r = await fetch(`/pcm?i=${i}&s=${(s0 / sr).toFixed(6)}&n=${n}&sr=${sr}`);
-        buf = new Float32Array(await r.arrayBuffer());
-      } catch (e) { return; }
+      if (lead > 3) { await sleep((lead - 3) * 1000); continue; }
+      const ab = await getBlock(i, b);
       if (gen !== this.gen) return;
-      const ab = ctx.createBuffer(2, n, sr);
-      const L = ab.getChannelData(0), R = ab.getChannelData(1);
-      for (let k = 0; k < n; k++) { L[k] = buf[2 * k]; R[k] = buf[2 * k + 1]; }
-      const src = ctx.createBufferSource();
-      src.buffer = ab;
-      src.connect(t.gainNode);
-      const now = ctx.currentTime;
-      if (when >= now) src.start(when);
-      else if (now - when < n / sr) src.start(now, now - when);
-      this.sources.push(src);
-      src.onended = () => { const k = this.sources.indexOf(src); if (k >= 0) this.sources.splice(k, 1); };
-      s0 += n;
+      if (ab) {
+        let at = Math.max(when, this.ctx0);
+        let off = at - when;                       // 開始位置がブロックの途中なら途中から
+        const now = ctx.currentTime;
+        if (at < now) { off += now - at; at = now; }   // 取得が間に合わなかった場合だけ
+        if (off < ab.duration) {
+          const src = ctx.createBufferSource();
+          src.buffer = ab; src.connect(t.gainNode);
+          src.start(at, off);
+          this.sources.push(src);
+          src.onended = () => { const k = this.sources.indexOf(src); if (k >= 0) this.sources.splice(k, 1); };
+        }
+      }
+      b++;
     }
   },
 };
 
-function applyGains() {
-  for (const t of tracks) if (t.gainNode) t.gainNode.gain.setTargetAtTime(t.mute ? 0 : t.gain, ctx.currentTime, 0.01);
+// ---------------------------------------------------------------- scrub
+let scrubOn = true, lastScrub = 0, scrubTimer = null, scrubNext = null;
+function scrub(T, dur = 0.08) {
+  if (!scrubOn || player.playing) return;
+  const ms = performance.now();
+  if (ms - lastScrub < 40) {                     // 鳴らしすぎない（最後の位置だけ後で鳴らす）
+    scrubNext = [T, dur];
+    if (!scrubTimer) scrubTimer = setTimeout(() => { scrubTimer = null; const a = scrubNext; scrubNext = null; scrub(...a); }, 40 - (ms - lastScrub));
+    return;
+  }
+  lastScrub = ms;
+  ctx.resume();
+  const parts = [];
+  tracks.forEach((t, i) => {
+    if (!t.audio) return;
+    const f = T - t.offset;
+    if (f < 0 || f >= audioEnd(t)) return;
+    const b = Math.floor(f / BLOCK_SEC);
+    if (f - b * BLOCK_SEC > BLOCK_SEC * 0.6) getBlock(i, b + 1);       // 次も先読み
+    else if (b > 0 && f - b * BLOCK_SEC < BLOCK_SEC * 0.4) getBlock(i, b - 1);
+    parts.push(getBlock(i, b).then(ab => ab && { t, ab, off: f - b * BLOCK_SEC }));
+  });
+  // 全トラックを同じ瞬間に鳴らす（揃っているかを聞き比べられるように）
+  Promise.all(parts).then(list => {
+    if (player.playing || performance.now() - ms > 300) return;   // 遅れて届いた古い位置は鳴らさない
+    const t0 = ctx.currentTime + 0.01, fade = 0.005;
+    for (const p of list) {
+      if (!p) continue;
+      const g = ctx.createGain(); g.connect(p.t.gainNode);
+      g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(1, t0 + fade);
+      g.gain.setValueAtTime(1, t0 + dur - fade); g.gain.linearRampToValueAtTime(0, t0 + dur);
+      const s = ctx.createBufferSource(); s.buffer = p.ab; s.connect(g);
+      s.start(t0, p.off, Math.min(dur, p.ab.duration - p.off));
+    }
+  });
 }
+function toggleScrub() { scrubOn = !scrubOn; $("scrub").classList.toggle("on", scrubOn); }
+
+// ---------------------------------------------------------------- mute / solo
+function applyGains() {
+  const anySolo = tracks.some(t => t.audio && t.solo);
+  for (const t of tracks) {
+    if (!t.gainNode) continue;
+    const audible = !t.mute && (!anySolo || t.solo);
+    t.gainNode.gain.setTargetAtTime(audible ? t.gain : 0, ctx.currentTime, 0.01);
+    if (t.row) {
+      t.row.querySelector(".mute").classList.toggle("on", !!t.mute);
+      t.row.querySelector(".solo").classList.toggle("on", !!t.solo);
+      t.row.classList.toggle("silent", t.audio && !audible);
+    }
+  }
+}
+function toggleMute(i) { const t = tracks[i]; if (!t.audio) return; t.mute = !t.mute; applyGains(); markDirty(i); }
+function toggleSolo(i) { const t = tracks[i]; if (!t.audio) return; t.solo = !t.solo; applyGains(); }
 
 // ---------------------------------------------------------------- server sync
 let saveTimer = null;
@@ -269,7 +361,7 @@ function buildMips(raw) {
   const mips = [raw];
   let cur = raw;
   while (cur.length > 4) {
-    const n = Math.ceil(cur.length / 4);   // ペア数 / 2
+    const n = Math.ceil(cur.length / 4);   // (min,max) の組を 2 つずつまとめる → 1 段ごとに 1/2
     const nx = new Uint8Array(n * 2);
     for (let k = 0; k < n; k++) {
       const a = 4 * k, b = a + 2;
@@ -355,8 +447,8 @@ function drawRow(i) {
     const pps = S.peaks_per_sec;
     const spp = pps / view.pps;           // 1px あたりのピーク数
     let lvl = 0;
-    while (lvl + 1 < t.wave.mips.length && (1 << (2 * (lvl + 1))) <= spp) lvl++;
-    const arr = t.wave.mips[lvl], per = 1 << (2 * lvl), n = arr.length / 2;
+    while (lvl + 1 < t.wave.mips.length && (1 << (lvl + 1)) <= spp) lvl++;
+    const arr = t.wave.mips[lvl], per = 1 << lvl, n = arr.length / 2;
     const mid = h / 2, amp = (h / 2 - 6) * t.wave.norm / 128;
     g.fillStyle = C("--wave");
     const x0 = Math.max(0, Math.floor(xa)), x1 = Math.min(w, Math.ceil(xb));
@@ -408,6 +500,7 @@ function syncVideos() {
     t.offEl.style.display = inside ? "none" : "flex";
     if (!inside) { if (!t.el.paused) t.el.pause(); continue; }
     if (t.el.readyState < 1) continue;
+    if (player.playing && !player.ready) continue;
     if (player.playing) {
       const diff = t.el.currentTime - want;
       if (Math.abs(diff) > 0.12 || t.el.paused) {
@@ -427,7 +520,7 @@ let lastDraw = 0;
 function tick(ts) {
   if (player.playing) {
     const T = player.now();
-    if (looping && T > loopRange[1]) player.start(loopRange[0]);
+    if (looping && player.ready && T > loopRange[1]) player.start(loopRange[0], { fast: true });
     // 再生ヘッドが画面外に出たら追う
     const cw = $("ruler").clientWidth;
     if (tToX(T) > cw * 0.92) { view.start = T - (cw * 0.1) / view.pps; }
@@ -443,9 +536,10 @@ let loopRange = [0, 0];
 function togglePlay() { if (player.playing) player.stop(); else { if (looping) setLoopAround(playhead); player.start(looping ? loopRange[0] : playhead); } drawAll(); }
 function updatePlayBtn() { $("play").textContent = player.playing ? "■ 停止" : "▶ 再生"; $("play").classList.toggle("on", player.playing); }
 function setLoopAround(T) { loopRange = [T - 1, T + 1]; }
-function seek(T) {
+function seek(T, scrubDur) {
   playhead = T;
   if (player.playing) player.start(looping ? (setLoopAround(T), loopRange[0]) : T);
+  else scrub(T, scrubDur);
   drawAll();
 }
 
@@ -467,7 +561,7 @@ function fitOverlap() {
 
 function alignMarkers() {
   const ref = tracks[sel];
-  if (ref.marker == null) { alert("選択中のトラックにマーカーがありません（M キー または Alt+クリック）"); return; }
+  if (ref.marker == null) { alert("選択中のトラックにマーカーがありません（K キー または Alt+クリック）"); return; }
   const T = ref.offset + ref.marker;
   pushUndo();
   tracks.forEach((t, i) => { if (i !== sel && t.marker != null) { t.offset = Math.round((T - t.marker) * 1e6) / 1e6; markDirty(i); } });
@@ -522,16 +616,12 @@ function buildTrack(t, i) {
   row.querySelectorAll("button[data-d]").forEach(b => b.onclick = () => nudge(i, parseFloat(b.dataset.d)));
   row.querySelectorAll("button[data-f]").forEach(b => b.onclick = () => nudge(i, parseFloat(b.dataset.f) / refFps()));
   const muteB = row.querySelector(".mute"), soloB = row.querySelector(".solo"), gainR = row.querySelector(".gain");
-  muteB.classList.toggle("on", t.mute);
   gainR.value = t.gain;
   if (!t.audio) { muteB.disabled = soloB.disabled = gainR.disabled = true; }
-  muteB.onclick = () => { t.mute = !t.mute; muteB.classList.toggle("on", t.mute); applyGains(); markDirty(i); };
-  soloB.onclick = () => {
-    const on = !soloB.classList.contains("on");
-    tracks.forEach((u, k) => { if (!u.audio) return; u.mute = on ? k !== i : false; u.row.querySelector(".mute").classList.toggle("on", u.mute); u.row.querySelector(".solo").classList.toggle("on", on && k === i); markDirty(k); });
-    applyGains();
-  };
+  muteB.onclick = () => toggleMute(i);
+  soloB.onclick = () => toggleSolo(i);
   gainR.oninput = () => { t.gain = parseFloat(gainR.value); applyGains(); markDirty(i); };
+  gainR.onchange = () => gainR.blur();   // 矢印キーをスライダーに取られないように
   row.querySelector(".ctl").addEventListener("mousedown", () => select(i));
   attachCanvas(t, i);
 
@@ -591,8 +681,8 @@ function rulerDrag() {
   cv.addEventListener("mousedown", (e) => {
     const rect = cv.getBoundingClientRect();
     seek(xToT(e.clientX - rect.left));
-    const mv = (ev) => { playhead = xToT(ev.clientX - rect.left); if (!player.playing) drawAll(); };
-    const up = (ev) => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); seek(xToT(ev.clientX - rect.left)); };
+    const mv = (ev) => { if (player.playing) return; playhead = xToT(ev.clientX - rect.left); scrub(playhead); drawAll(); };
+    const up = (ev) => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); if (player.playing) seek(xToT(ev.clientX - rect.left)); };
     window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
   });
 }
@@ -610,12 +700,15 @@ function keys(e) {
   if (e.ctrlKey || e.metaKey) return;
   const map = {
     " ": () => togglePlay(),
-    "ArrowLeft": () => seek(player.now() - (e.shiftKey ? 1 : fr)),
-    "ArrowRight": () => seek(player.now() + (e.shiftKey ? 1 : fr)),
+    "ArrowLeft": () => seek(player.now() - (e.shiftKey ? 1 : fr), Math.max(0.08, fr)),
+    "ArrowRight": () => seek(player.now() + (e.shiftKey ? 1 : fr), Math.max(0.08, fr)),
     ",": () => nudge(sel, -0.001), ".": () => nudge(sel, 0.001),
     "<": () => nudge(sel, -0.01), ">": () => nudge(sel, 0.01),
     "[": () => nudge(sel, -fr), "]": () => nudge(sel, fr),
-    "m": () => setMarker(sel, player.now() - tracks[sel].offset),
+    "k": () => setMarker(sel, player.now() - tracks[sel].offset),
+    "m": () => toggleMute(sel),
+    "s": () => toggleSolo(sel),
+    "u": () => toggleScrub(),
     "a": () => alignMarkers(),
     "l": () => toggleLoop(),
     "z": () => fitAll(), "x": () => fitOverlap(),
@@ -688,9 +781,10 @@ async function pollPrep() {
 // ---------------------------------------------------------------- init
 (async function init() {
   S = await (await fetch("/api/state")).json();
-  tracks = S.tracks.map(t => ({ ...t, peaks: undefined, proxy: undefined }));
+  tracks = S.tracks.map(t => ({ ...t, peaks: undefined, proxy: undefined, solo: false }));
   tracks.forEach(buildTrack);
   applyGains();
+  $("scrub").onclick = toggleScrub;
   select(0);
   $("play").onclick = togglePlay;
   $("loop").onclick = toggleLoop;
